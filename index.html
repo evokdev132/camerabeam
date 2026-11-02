@@ -76,6 +76,10 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--beam);outline-o
 .btn.primary:disabled{opacity:.35;box-shadow:none}
 .note{font-size:12.5px;color:var(--muted)}
 .note.err{color:var(--bad)}
+.elev-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.elev-row label{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.elev-row .field{width:96px;flex:none;font-family:var(--mono);padding:8px 10px}
+.elev-row .note{flex:1;min-width:150px}
 
 /* map markers */
 .wp-icon{position:relative;width:26px;height:26px}
@@ -151,6 +155,11 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--beam);outline-o
     <input class="field" id="wpName" placeholder="Название метки" maxlength="40" autocomplete="off">
     <input class="field" id="coordIn" placeholder="или координаты: 55.7539, 37.6208" inputmode="decimal" autocomplete="off">
   </div>
+  <div class="elev-row" id="elevRow" hidden>
+    <label for="wpElev">Высота метки, м</label>
+    <input class="field" id="wpElev" type="number" inputmode="decimal" step="1" placeholder="…">
+    <span class="note" id="elevInfo"></span>
+  </div>
   <div class="row">
     <button class="btn primary" id="arBtn" disabled>Включить камеру</button>
     <button class="btn" id="clearBtn" hidden>Убрать метку</button>
@@ -166,6 +175,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--beam);outline-o
     <div class="hud-card">
       <div class="stat"><span class="lbl">Дистанция</span><b id="hDist">—</b></div>
       <div class="stat"><span class="lbl">Курс</span><b id="hHead">—</b></div>
+      <div class="stat"><span class="lbl">Перепад</span><b id="hDz">—</b></div>
       <div class="stat"><span class="lbl">GPS</span><b id="hAcc">—</b></div>
     </div>
   </div>
@@ -210,8 +220,9 @@ const store = {
   set(k, v) { try { localStorage.setItem("beacon." + k, JSON.stringify(v)); } catch {} }
 };
 const S = {
-  wp: store.get("wp", null),          // {lat, lon, name}
-  me: null,                            // {lat, lon, acc, t}
+  wp: store.get("wp", null),          // {lat, lon, name, elev, elevSrc: "dem"|"manual"}
+  me: null,                            // {lat, lon, acc, alt, t}
+  meElev: null,                        // {v, src: "dem"|"gps", lat, lon}
   cfg: Object.assign({ fov: 68, off: 0, hgt: 400, color: COLORS[0] }, store.get("cfg", {}))
 };
 const saveCfg = () => store.set("cfg", S.cfg);
@@ -250,8 +261,10 @@ let wpMarker = null, meMarker = null, accCircle = null, link = null, firstFix = 
 
 function setWaypoint(lat, lon, keepName) {
   const name = keepName && S.wp ? S.wp.name : ($("wpName").value.trim() || "Метка");
-  S.wp = { lat, lon, name };
+  const same = S.wp && S.wp.lat === lat && S.wp.lon === lon;
+  S.wp = same ? Object.assign(S.wp, { name }) : { lat, lon, name, elev: null, elevSrc: null };
   store.set("wp", S.wp);
+  if (S.wp.elev == null) requestWpElev();
   if (!wpMarker) {
     wpMarker = L.marker([lat, lon], { icon: wpIcon, draggable: true }).addTo(map);
     wpMarker.on("dragend", e => { const p = e.target.getLatLng(); setWaypoint(p.lat, p.lng, true); });
@@ -271,6 +284,13 @@ function refreshMapInfo() {
   $("clearBtn").hidden = !has;
   $("hint").textContent = has ? "Метку можно перетащить" : "Нажмите на карту, чтобы поставить метку";
   $("mAcc").textContent = S.me ? "±" + Math.round(S.me.acc) + " м" : "—";
+  $("elevRow").hidden = !has;
+  if (has) {
+    if (document.activeElement !== $("wpElev")) $("wpElev").value = S.wp.elev == null ? "" : Math.round(S.wp.elev);
+    const mine = S.meElev ? "вы: " + Math.round(S.meElev.v) + " м" + (S.meElev.src === "gps" ? " (GPS)" : "") : "ваша высота: жду…";
+    const dz = heightDiff();
+    $("elevInfo").textContent = mine + (dz != null ? " · перепад " + fmtDz(dz) : "") + (S.wp.elevSrc === "manual" ? " · вручную" : "");
+  }
   if (has && S.me) {
     const { d, brg } = distBearing(S.me, S.wp);
     $("mDist").textContent = fmtDist(d); $("mBrg").textContent = fmtDeg(brg);
@@ -293,9 +313,51 @@ $("coordIn").addEventListener("change", () => {
   if (Math.abs(lat) > 90 || Math.abs(lon) > 180) { toast("Координаты вне диапазона"); return; }
   setWaypoint(lat, lon); map.setView([lat, lon], Math.max(map.getZoom(), 16));
 });
+$("wpElev").addEventListener("change", () => {
+  if (!S.wp) return;
+  const v = parseFloat($("wpElev").value.replace(",", "."));
+  if (Number.isFinite(v)) { S.wp.elev = v; S.wp.elevSrc = "manual"; store.set("wp", S.wp); refreshMapInfo(); }
+  else { S.wp.elev = null; S.wp.elevSrc = null; requestWpElev(); }
+});
 $("locateBtn").onclick = () => S.me ? map.setView([S.me.lat, S.me.lon], Math.max(map.getZoom(), 16)) : toast("Жду сигнал GPS…");
 
 if (S.wp) { $("wpName").value = S.wp.name || ""; setWaypoint(S.wp.lat, S.wp.lon, true); }
+
+/* ---------------- terrain elevation (Open-Meteo, Copernicus DEM ~90 m) ---------------- */
+async function fetchElev(points) {
+  const q = k => points.map(p => p[k].toFixed(5)).join(",");
+  const r = await fetch("https://api.open-meteo.com/v1/elevation?latitude=" + q("lat") + "&longitude=" + q("lon"));
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const j = await r.json();
+  if (!Array.isArray(j.elevation)) throw new Error("bad response");
+  return j.elevation;
+}
+function requestWpElev() {
+  const wp = S.wp; if (!wp) return;
+  $("elevInfo").textContent = "Узнаю высоту рельефа…";
+  fetchElev([wp]).then(([h]) => {
+    if (S.wp !== wp || wp.elevSrc === "manual") return;
+    wp.elev = h; wp.elevSrc = "dem"; store.set("wp", wp); refreshMapInfo();
+  }).catch(() => {
+    if (S.wp === wp) { $("elevInfo").textContent = "Не удалось узнать высоту — впишите её вручную."; }
+  });
+}
+let meElevBusy = false;
+function maybeFetchMyElev() {
+  if (!S.me || meElevBusy) return;
+  if (S.meElev && S.meElev.src === "dem" && distBearing(S.meElev, S.me).d < 40) return;
+  meElevBusy = true;
+  const at = { lat: S.me.lat, lon: S.me.lon };
+  fetchElev([at]).then(([h]) => { S.meElev = { v: h, src: "dem", lat: at.lat, lon: at.lon }; refreshMapInfo(); })
+    .catch(() => { if (S.me.alt != null && (!S.meElev || S.meElev.src === "gps")) { S.meElev = { v: S.me.alt, src: "gps", lat: at.lat, lon: at.lon }; refreshMapInfo(); } })
+    .finally(() => { setTimeout(() => meElevBusy = false, 5000); });
+}
+// target ground height minus my ground height; null when unknown
+function heightDiff() {
+  if (!S.wp || S.wp.elev == null || !S.meElev) return null;
+  return S.wp.elev - S.meElev.v;
+}
+const fmtDz = v => v == null ? "—" : (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(Math.round(v)) + " м";
 
 /* ---------------- geolocation ---------------- */
 if (!window.isSecureContext) {
@@ -304,7 +366,8 @@ if (!window.isSecureContext) {
 }
 if ("geolocation" in navigator) {
   navigator.geolocation.watchPosition(p => {
-    S.me = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, t: p.timestamp };
+    S.me = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, alt: p.coords.altitude, t: p.timestamp };
+    maybeFetchMyElev();
     const ll = [S.me.lat, S.me.lon];
     if (!meMarker) {
       accCircle = L.circle(ll, { radius: S.me.acc, color: "#3b8cff", weight: 1, fillOpacity: .12 }).addTo(map);
@@ -472,8 +535,10 @@ function frame(now) {
   const proj = c => ({ x: cx + f * c.x / c.z, y: cy - f * c.y / c.z });
   const NEAR = 0.8;
 
-  let base = toCam([e, n, -EYE_H - drop]);
-  let top = toCam([e, n, S.cfg.hgt - EYE_H - drop]);
+  const dz = heightDiff() ?? 0;
+  const z0 = dz - EYE_H - drop;
+  let base = toCam([e, n, z0]);
+  let top = toCam([e, n, z0 + S.cfg.hgt]);
   const head = camHeading();
   const hfov = 2 * Math.atan(W / 2 / f) * R2D;
   const rel = wrap180(brg - head);
@@ -488,7 +553,7 @@ function frame(now) {
     const pb = proj(base), pt = proj(top);
     onScreen = pb.x > -60 && pb.x < W + 60;
     drawBeam(pb, pt, f * BEAM_R / base.z, f * BEAM_R / top.z, t);
-    if (d > 3) drawRings(e, n, -EYE_H - drop, toCam, proj, NEAR, t);
+    if (d > 3) drawRings(e, n, z0, toCam, proj, NEAR, t);
     ctx.globalCompositeOperation = "source-over";
     if (onScreen) drawLabel(pb, pt, d, H);
   }
@@ -500,6 +565,7 @@ function frame(now) {
     hudT = now;
     $("hDist").textContent = fmtDist(d);
     $("hHead").textContent = fmtDeg(head);
+    $("hDz").textContent = fmtDz(heightDiff());
     $("hAcc").textContent = "±" + Math.round(S.me.acc) + " м";
     if (O.src === "relative" && sinceStart > 2500 && !relWarned) { relWarned = true; toast("Браузер не даёт абсолютный компас — направление может быть неточным. Используйте «Смотрю на точку».", 5000); }
   }
@@ -511,7 +577,7 @@ function drawBeam(pb, pt, wb, wt, t) {
   const px = -dy, py = dx;
   const flicker = 1 + 0.06 * Math.sin(t * 7.3) + 0.04 * Math.sin(t * 13.1);
   // stacked additive layers give a soft, glowing falloff
-  const layers = [[9, 4, .05], [5.5, 3, .07], [3.4, 2.4, .1], [2.1, 1.8, .16], [1.3, 1.3, .26], [.75, .9, .42], [.32, .6, .9]];
+  const layers = [[9, 16, .05], [5.5, 11, .07], [3.4, 7, .1], [2.1, 4.5, .16], [1.3, 3, .26], [.75, 2, .42], [.32, 1.2, .9]];
   for (let i = 0; i < layers.length; i++) {
     const [mul, minW, alpha] = layers[i];
     const core = i === layers.length - 1;
@@ -554,7 +620,8 @@ function drawRings(e, n, z, toCam, proj, NEAR, t) {
 
 function drawLabel(pb, pt, d, H) {
   const name = (S.wp.name || "Метка");
-  const x = pb.x, y = Math.min(Math.max(pb.y - 36, 150), H - 190);
+  // label sits above the foot of the beam; if the foot is high on screen, put it below so it never covers the beam
+  const x = pb.x, y = pb.y - 36 < 160 ? Math.min(Math.max(pb.y + 70, 160), H - 190) : Math.min(pb.y - 36, H - 190);
   ctx.font = "700 15px Manrope, system-ui, sans-serif";
   const t1 = name, t2 = fmtDist(d);
   ctx.font = "700 15px Manrope, system-ui, sans-serif"; const w1 = ctx.measureText(t1).width;
