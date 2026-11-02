@@ -186,8 +186,8 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--beam);outline-o
         <input type="range" id="fov" min="40" max="100" step="1"></label>
       <label>Поправка компаса <output id="offOut"></output>
         <input type="range" id="off" min="-45" max="45" step="0.5"></label>
-      <label>Высота столба <output id="hgtOut"></output>
-        <input type="range" id="hgt" min="20" max="1500" step="10"></label>
+      <label>Толщина столба <output id="radOut"></output>
+        <input type="range" id="rad" min="0.5" max="15" step="0.5"></label>
       <div class="row" style="justify-content:space-between">
         <div class="swatches" id="swatches"></div>
         <button class="btn" id="resetCal">Сбросить</button>
@@ -210,7 +210,6 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--beam);outline-o
 "use strict";
 const R_EARTH = 6371000, D2R = Math.PI / 180, R2D = 180 / Math.PI;
 const EYE_H = 1.5;          // camera height above ground, m
-const BEAM_R = 2.5;         // beam radius, m
 const COLORS = ["#5ef0ff", "#ffd35e", "#ff6bd6", "#7dff8a", "#ffffff"];
 const $ = id => document.getElementById(id);
 
@@ -223,7 +222,7 @@ const S = {
   wp: store.get("wp", null),          // {lat, lon, name, elev, elevSrc: "dem"|"manual"}
   me: null,                            // {lat, lon, acc, alt, t}
   meElev: null,                        // {v, src: "dem"|"gps", lat, lon}
-  cfg: Object.assign({ fov: 68, off: 0, hgt: 400, color: COLORS[0] }, store.get("cfg", {}))
+  cfg: Object.assign({ fov: 68, off: 0, rad: 2.5, color: COLORS[0] }, store.get("cfg", {}))
 };
 const saveCfg = () => store.set("cfg", S.cfg);
 document.documentElement.style.setProperty("--beam", S.cfg.color);
@@ -538,7 +537,7 @@ function frame(now) {
   const dz = heightDiff() ?? 0;
   const z0 = dz - EYE_H - drop;
   let base = toCam([e, n, z0]);
-  let top = toCam([e, n, z0 + S.cfg.hgt]);
+  let top = toCam([e, n, z0 + 30000]);   // effectively endless, like a game waypoint
   const head = camHeading();
   const hfov = 2 * Math.atan(W / 2 / f) * R2D;
   const rel = wrap180(brg - head);
@@ -552,7 +551,7 @@ function frame(now) {
     if (top.z < NEAR) top = lerpC(top, base, (NEAR - top.z) / (base.z - top.z));
     const pb = proj(base), pt = proj(top);
     onScreen = pb.x > -60 && pb.x < W + 60;
-    drawBeam(pb, pt, f * BEAM_R / base.z, f * BEAM_R / top.z, t);
+    drawBeam(pb, pt, f * S.cfg.rad / base.z, f * S.cfg.rad / top.z, t, W, H);
     if (d > 3) drawRings(e, n, z0, toCam, proj, NEAR, t);
     ctx.globalCompositeOperation = "source-over";
     if (onScreen) drawLabel(pb, pt, d, H);
@@ -572,29 +571,57 @@ function frame(now) {
 }
 let relWarned = false;
 
-function drawBeam(pb, pt, wb, wt, t) {
+function drawBeam(pb, pt, wb, wt, t, W, H) {
+  // the beam goes up "to the sky": cut the projected segment where it leaves a box well outside the screen,
+  // so the fade only shows where the beam really converges to the zenith on screen
+  const M = 2 * Math.max(W, H), lo = { x: -M, y: -M }, hi = { x: W + M, y: H + M };
+  let k = 1;
+  for (const a of ["x", "y"]) {
+    const dv = pt[a] - pb[a];
+    if (pt[a] < lo[a] && dv < 0) k = Math.min(k, (lo[a] - pb[a]) / dv);
+    if (pt[a] > hi[a] && dv > 0) k = Math.min(k, (hi[a] - pb[a]) / dv);
+  }
+  k = Math.max(0, k);
+  const fadesOnScreen = k >= 1;            // the end of the segment is the beam's vanishing point
+  pt = { x: pb.x + (pt.x - pb.x) * k, y: pb.y + (pt.y - pb.y) * k };
+  wt = wb + (wt - wb) * k;
+
   let dx = pt.x - pb.x, dy = pt.y - pb.y; const len = Math.hypot(dx, dy) || 1; dx /= len; dy /= len;
   const px = -dy, py = dx;
-  const flicker = 1 + 0.06 * Math.sin(t * 7.3) + 0.04 * Math.sin(t * 13.1);
-  // stacked additive layers give a soft, glowing falloff
-  const layers = [[9, 16, .05], [5.5, 11, .07], [3.4, 7, .1], [2.1, 4.5, .16], [1.3, 3, .26], [.75, 2, .42], [.32, 1.2, .9]];
-  for (let i = 0; i < layers.length; i++) {
-    const [mul, minW, alpha] = layers[i];
-    const core = i === layers.length - 1;
-    const hb = Math.max(minW, wb * mul) * flicker / 2, ht = Math.max(minW * .6, wt * mul) * flicker / 2;
-    const g = ctx.createLinearGradient(pb.x, pb.y, pt.x, pt.y);
-    const col = core ? "#ffffff" : S.cfg.color;
-    g.addColorStop(0, rgba(col, alpha));
-    g.addColorStop(.35, rgba(col, alpha * .8));
-    g.addColorStop(1, rgba(col, 0));
-    ctx.fillStyle = g;
+  const flicker = 1 + 0.05 * Math.sin(t * 7.3) + 0.03 * Math.sin(t * 13.1);
+  const quad = (hb, ht) => {
     ctx.beginPath();
     ctx.moveTo(pb.x + px * hb, pb.y + py * hb);
     ctx.lineTo(pt.x + px * ht, pt.y + py * ht);
     ctx.lineTo(pt.x - px * ht, pt.y - py * ht);
     ctx.lineTo(pb.x - px * hb, pb.y - py * hb);
-    ctx.closePath(); ctx.fill();
+    ctx.closePath();
+  };
+  // stacked additive layers give a soft, glowing falloff; brightness stays even along the beam
+  const layers = [[9, 16, .05], [5.5, 11, .07], [3.4, 7, .1], [2.1, 4.5, .16], [1.3, 3, .26], [.75, 2, .42], [.32, 1.2, .9]];
+  for (let i = 0; i < layers.length; i++) {
+    const [mul, minW, alpha] = layers[i];
+    const core = i === layers.length - 1;
+    // halo shrinks relative to the core when the beam is close and already wide on screen
+    const m = w => mul > 1 ? 1 + (mul - 1) / (1 + w / 20) : mul;
+    const hb = Math.max(minW, wb * m(wb)) * flicker / 2, ht = Math.max(minW, wt * m(wt)) * flicker / 2;
+    const g = ctx.createLinearGradient(pb.x, pb.y, pt.x, pt.y);
+    const col = core ? "#ffffff" : S.cfg.color;
+    g.addColorStop(0, rgba(col, alpha));
+    g.addColorStop(fadesOnScreen ? .55 : .9, rgba(col, alpha * .9));
+    g.addColorStop(1, rgba(col, fadesOnScreen ? 0 : alpha * .6));
+    ctx.fillStyle = g; quad(hb, ht); ctx.fill();
   }
+  // energy bands running up the beam
+  const bw = Math.max(3, wb * 1.3) / 2, tw = Math.max(3, wt * 1.3) / 2;
+  ctx.save(); quad(bw, tw); ctx.clip();
+  const step = Math.max(24, Math.min(120, wb * 4)), off = (t * step * 1.6) % step;
+  ctx.fillStyle = rgba("#ffffff", .16);
+  for (let s = off; s < Math.min(len, 4000); s += step) {
+    const cx = pb.x + dx * s, cy = pb.y + dy * s;
+    ctx.beginPath(); ctx.ellipse(cx, cy, step * .18, Math.max(bw, tw) * 1.2, Math.atan2(dy, dx), 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
   // glow at the foot
   const r = Math.max(14, wb * 6);
   const rg = ctx.createRadialGradient(pb.x, pb.y, 0, pb.x, pb.y, r);
@@ -709,7 +736,7 @@ $("alignBtn").onclick = () => {
 function syncSettings() {
   $("fov").value = S.cfg.fov; $("fovOut").textContent = S.cfg.fov + "°";
   $("off").value = S.cfg.off; $("offOut").textContent = (S.cfg.off > 0 ? "+" : "") + S.cfg.off.toFixed(1) + "°";
-  $("hgt").value = S.cfg.hgt; $("hgtOut").textContent = S.cfg.hgt + " м";
+  $("rad").value = S.cfg.rad; $("radOut").textContent = (S.cfg.rad * 2).toFixed(0) + " м";
   [...$("swatches").children].forEach(b => b.setAttribute("aria-pressed", String(b.dataset.c === S.cfg.color)));
 }
 COLORS.forEach(c => {
@@ -720,7 +747,7 @@ COLORS.forEach(c => {
 });
 $("fov").oninput = e => { S.cfg.fov = +e.target.value; saveCfg(); syncSettings(); };
 $("off").oninput = e => { S.cfg.off = +e.target.value; B = null; saveCfg(); syncSettings(); };
-$("hgt").oninput = e => { S.cfg.hgt = +e.target.value; saveCfg(); syncSettings(); };
+$("rad").oninput = e => { S.cfg.rad = +e.target.value; saveCfg(); syncSettings(); };
 $("resetCal").onclick = () => { S.cfg.fov = 68; S.cfg.off = 0; B = null; saveCfg(); syncSettings(); };
 syncSettings();
 refreshMapInfo();
